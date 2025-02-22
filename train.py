@@ -2,6 +2,25 @@
 Usage:
 Training:
 python train.py --config-name=train_diffusion_lowdim_workspace
+# robomimic benchmark
+# lift 
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=lift_image_abs hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=lift_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+# can
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=can_image_abs hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=can_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+# square
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=square_image_abs hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=square_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+# transport
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=transport_image_abs hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=transport_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+# toolhang
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=tool_hang_image_abs hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=tool_hang_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+# pusht benchmark
+# pusht
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 """
 
 import sys
@@ -28,6 +47,8 @@ def main(cfg: OmegaConf):
     OmegaConf.resolve(cfg)
 
     cls = hydra.utils.get_class(cfg._target_)
+    # if cfg.training.debug:
+    #     import pdb;pdb.set_trace()
     workspace: BaseWorkspace = cls(cfg)
     workspace.run()
 

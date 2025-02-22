@@ -31,7 +31,7 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
+class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -158,8 +158,8 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        # if cfg.training.debug:
-                        #     import pdb;pdb.set_trace()
+                        if cfg.training.debug:
+                            import pdb;pdb.set_trace()
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
