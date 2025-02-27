@@ -1,10 +1,6 @@
 """
 Usage:
-Training:
-python finetune.py --config-name=train_diffusion_lowdim_workspace
-# pusht benchmark
-# pusht
-python finetune.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 """
 
 import sys
@@ -31,6 +27,8 @@ def main(cfg: OmegaConf):
     OmegaConf.resolve(cfg)
 
     cls = hydra.utils.get_class(cfg._target_)
+    # if cfg.training.debug:
+    #     import pdb;pdb.set_trace()
     workspace: BaseWorkspace = cls(cfg)
     workspace.run()
 

@@ -1,6 +1,6 @@
 """
 Usage:
-python eval.py --checkpoint data/image/pusht/diffusion_policy_cnn/train_0/checkpoints/latest.ckpt -o data/pusht_eval_output
+python eval.py --checkpoint data/experiments/image/pusht/diffusion_policy_transformer/train_0/checkpoints/latest.ckpt -o data/eval/diffusion_policy_transformer_hybrid_pusht_train_0_latest
 """
 
 import sys
@@ -22,7 +22,8 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 @click.option('-c', '--checkpoint', required=True)
 @click.option('-o', '--output_dir', required=True)
 @click.option('-d', '--device', default='cuda:0')
-def main(checkpoint, output_dir, device):
+@click.option('-e', '--eval-time', is_flag=True, default=False)
+def main(checkpoint, output_dir, device, eval_time):
     if os.path.exists(output_dir):
         click.confirm(f"Output path {output_dir} already exists! Overwrite?", abort=True)
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -44,6 +45,37 @@ def main(checkpoint, output_dir, device):
     policy.to(device)
     policy.eval()
     
+    # register hooks for checking inference time and memory usage
+    if eval_time:
+        # count parameters of the model
+        def count_parameters(model):
+            return sum(p.numel() for p in model.parameters())
+
+        submodules = {
+            # diffusion transformer
+            "policy.model": policy.model,
+            "policy.model.input_emb": policy.model.input_emb,
+            "policy.model.cond_obs_emb": policy.model.cond_obs_emb,
+            "policy.model.encoder": policy.model.encoder,
+            "policy.model.decoder": policy.model.decoder,
+            "policy.model.ln_f": policy.model.ln_f,
+            "policy.model.head": policy.model.head,
+            # obs encoder
+            "policy.obs_encoder": policy.obs_encoder,
+        }
+
+        for name, submodule in submodules.items():
+            num_params = count_parameters(submodule)
+            print(f"{name} - Number of parameters: {num_params / 1e6} M")
+
+        from lightvla.hooks import start_time_setup_hook, execute_time_record_hook, execution_times, parameters_table, write_to_excel, print_table
+        from functools import partial
+        hook_handles = []
+        for name, submodule in submodules.items():
+            print(f"registering execute time hooks for {name}")
+            hook_handles.append(submodule.register_forward_pre_hook(start_time_setup_hook))
+            hook_handles.append(submodule.register_forward_hook(partial(execute_time_record_hook, name)))
+
     # run eval
     env_runner = hydra.utils.instantiate(
         cfg.task.env_runner,
