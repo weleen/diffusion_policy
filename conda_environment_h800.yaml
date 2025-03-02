@@ -7,9 +7,14 @@ channels:
 dependencies:
   - python=3.9
   - pip=22.2.2
-  - pytorch=2.4.0     # Updated from 1.12.1
-  - torchvision=0.17.0 # Updated from 0.13.1
+  - cudatoolkit=11.8  # Updated from 11.6
+  - pytorch=2.0.0     # Updated from 1.12.1
+  - torchvision # Updated from 0.13.1
   - pytorch3d=0.7.7
+  - glew
+  - mesalib
+  - menpo
+  - glfw3
   - numpy=1.23.3
   - numba==0.56.4
   - scipy==1.9.1
@@ -48,6 +53,7 @@ dependencies:
   # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625
   - llvm-openmp=14
   - pip:
+    - patchelf
     - ray[default,tune]==2.2.0
     # requires mujoco py dependencies libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
     - free-mujoco-py==2.1.6
