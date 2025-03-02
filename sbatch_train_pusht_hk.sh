@@ -1,10 +1,10 @@
 #!/bin/bash 
-#SBATCH -J mdt_calvin_hk
+#SBATCH -J diffusion_policy_pusht_hk
 #SBATCH -p gpux
-#SBATCH -n 4       # Number of tasks
-#SBATCH -c 16      # Number of cores per task
-#SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4
+#SBATCH -n 1       # Number of tasks
+#SBATCH -c 20      # Number of cores per task
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
 #SBATCH --time 72:00:00
 #SBATCH --comment=LightVLA
 #SBATCH -o /public/home/group_xudong/yimingwu/project/MyProjects/LightVLA/examples/diffusion_policy/jobs/diffusion_policy_pusht_hk/std.out.%j
