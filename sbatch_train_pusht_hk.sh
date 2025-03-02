@@ -52,6 +52,11 @@ echo -e "\n" | tee -a $LOG_FILE
 # Run the application
 echo "Running the application..." | tee -a $LOG_FILE
 
+# 设置分布式训练所需的环境变量
+export MASTER_ADDR=$(hostname -i)
+export MASTER_PORT=$(( 10000 + $RANDOM % 20000 ))
+export WORLD_SIZE=1
+
 # Change to the project directory
 cd /public/home/group_xudong/yimingwu/project/MyProjects/LightVLA/examples/diffusion_policy
 
@@ -61,6 +66,7 @@ source /public/home/group_xudong/yimingwu/miniconda3/etc/profile.d/conda.sh
 conda activate robodiff
 
 # Run the training script with full path
-python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+srun --ntasks=1 --ntasks-per-node=1 --cpus-per-task=20 --gres=gpu:1 \
+    python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
 echo "The end time is: `date +"%Y-%m-%d %H:%M:%S"` | tee -a $LOG_FILE"
