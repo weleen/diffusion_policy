@@ -19,14 +19,15 @@
 
 ### Get parameters from GUI
 
-MIDFILE_DIR=/public/home/group_xudong/yimingwu/project/MyProjects/LightVLA/examples/diffusion_policy/jobs/diffusion_policy_pusht_hk/.portal
-source $MIDFILE_DIR/job_portal.var
-source $MIDFILE_DIR/job_interface.var
+# Remove references to portal files that don't exist
+# MIDFILE_DIR=/public/home/group_xudong/yimingwu/project/MyProjects/LightVLA/examples/mdt/jobs/mdt_calvin_hk/.portal
+# source $MIDFILE_DIR/job_portal.var
+# source $MIDFILE_DIR/job_interface.var
 
 ### Set basic var   ### MARK_slurm2pbs
 
-WORK_DIR=/public/home/group_xudong/yimingwu/project/MyProjects/LightVLA/examples/diffusion_policy/jobs/diffusion_policy_pusht_hk
-JOB_NAME=diffusion_policy_pusht_hk
+WORK_DIR=/public/home/group_xudong/yimingwu/project/MyProjects/LightVLA/examples/mdt/jobs/mdt_calvin_hk
+JOB_NAME=mdt_calvin_hk
 JOBID=$SLURM_JOB_ID
 NP=$SLURM_NPROCS
 NNODE=`srun hostname | sort | uniq | wc -l`
@@ -56,13 +57,10 @@ cd /public/home/group_xudong/yimingwu/project/MyProjects/LightVLA/examples/diffu
 
 # Properly activate conda environment
 # Use the full path to conda and source the conda.sh file
-source $(conda info --base)/etc/profile.d/conda.sh
+source /public/home/group_xudong/yimingwu/miniconda3/etc/profile.d/conda.sh
 conda activate robodiff
 
-# Set environment variables
-export TORCH_USE_CUDA_DSA=1
-
-# Run the training script
-srun python mdt/training.py
+# Run the training script with full path
+python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
 echo "The end time is: `date +"%Y-%m-%d %H:%M:%S"` | tee -a $LOG_FILE"
