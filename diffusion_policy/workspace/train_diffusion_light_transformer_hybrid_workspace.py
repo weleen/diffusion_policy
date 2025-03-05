@@ -39,6 +39,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
+        logger.info(f"Initializing TrainDiffusionLightTransformerHybridWorkspace with config: {cfg}")
 
         # set seed
         seed = cfg.training.seed
@@ -204,22 +205,25 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                 wandb.run.summary["initial_selection_confidence"] = str(initial_conf)
 
         # get the pruned model
-        pruned_model = self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', 'pruned_model_epoch_0.ckpt'), device='cuda')
+        pruned_model = self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', 'pruned_model_epoch_0.ckpt'), device=device)
 
         # run evaluation at the beggining
         # original model
         if self.ema_model is not None:
             model_to_eval = self.ema_model
+            logger.info(f"Using EMA model for evaluation")
+            model_to_eval.eval()
         else:
             model_to_eval = self.model
+            logger.info(f"Using original model for evaluation")
         runner_log = env_runner.run(model_to_eval)
         # log all
-        logger.info(f"Original model evaluation\n{runner_log}")
+        logger.info(f"\nOriginal model evaluation\n{runner_log}")
 
         # initial pruned model
         runner_log = env_runner.run(pruned_model)
         # log all
-        logger.info(f"Initial pruned model evaluation\n{runner_log}")
+        logger.info(f"\nInitial pruned model evaluation\n{runner_log}")
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
@@ -319,13 +323,20 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                 print(f"Selection decisions: {decisions}")
                 print(f"Selection confidence: {conf}")
 
-                # get the pruned model
-                pruned_model = self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', f'pruned_model_epoch_{self.epoch}.ckpt'), device='cuda')
-
                 # ========= eval for this epoch ==========
                 # policy = self.model
                 # if cfg.training.use_ema:
                 #     policy = self.ema_model
+                # get the pruned model
+                if (self.epoch % cfg.training.val_every) == 0:
+                    save = False # do not save the model
+
+                if (self.epoch % cfg.training.rollout_every) == 0 or \
+                    (self.epoch % cfg.training.checkpoint_every) == 0:
+                    save = True
+
+                pruned_model = self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', f'pruned_model_epoch_{self.epoch}.ckpt'), device=device, save=save)
+
                 policy = pruned_model # use the pruned model for evaluation
                 policy.eval()
 
@@ -403,9 +414,8 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                 self.global_step += 1
                 self.epoch += 1
 
-            self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', f'pruned_model_epoch_{self.epoch}.ckpt'), device='cuda')
                 
-    def save_pruned_model(self, output_path, device='cpu'):
+    def save_pruned_model(self, output_path, device='cpu', save=True):
         """Save the pruned model based on the learned pruning decisions"""
         if self.ema_model is None:
             model = self.model
@@ -428,7 +438,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
             kept_layers.extend(selected_layers)
             layer_offset += option.size(1)
 
-        print(f"Saving pruned model with kept layers: {kept_layers}")
+        print(f"Prune model with kept layers: {kept_layers}")
 
         # Remove pruned layers from the model based on the architecture
         # TODO: dirty hack, need to fix this
@@ -443,15 +453,16 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
         del pruned_model.model.gumbel_gates
         
         # Save the pruned model state dict
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        torch.save({
-            'model': self.model.state_dict(),
-            'ema_model': self.ema_model.state_dict(),
-            'pruned_model': pruned_model.state_dict(),
-            'kept_layers': kept_layers,
-            'normalizer': self.model.normalizer.state_dict()
-        }, output_path)
-        print(f"Saved pruned model to {output_path}")
+        if save:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            torch.save({
+                'model': self.model.state_dict(),
+                'ema_model': self.ema_model.state_dict(),
+                'pruned_model': pruned_model.state_dict(),
+                'kept_layers': kept_layers,
+                'normalizer': self.model.normalizer.state_dict()
+            }, output_path)
+            print(f"Saved pruned model to {output_path}")
         # TODO: Remove pruned layers from the model based on the architecture
         return pruned_model
 
