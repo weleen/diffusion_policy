@@ -1,25 +1,25 @@
 defaults:
   - _self_
-  - task: pusht_image 
+  - task: lift_image_abs
 
-name: train_diffusion_light_transformer_hybrid
-_target_: diffusion_policy.workspace.train_diffusion_light_transformer_hybrid_workspace.TrainDiffusionLightTransformerHybridWorkspace
+name: train_diffusion_light_unet_hybrid
+_target_: diffusion_policy.workspace.train_diffusion_light_unet_hybrid_workspace.TrainDiffusionLightUnetHybridWorkspace
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "default"
 
-horizon: 10
+horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 keypoint_visible_rate: 1.0
-obs_as_cond: True
+obs_as_global_cond: True
 
 policy:
-  _target_: diffusion_policy.policy.diffusion_light_transformer_hybrid_image_policy.DiffusionLightTransformerHybridImagePolicy
+  _target_: diffusion_policy.policy.diffusion_light_unet_hybrid_image_policy.DiffusionLightUnetHybridImagePolicy
 
   shape_meta: ${shape_meta}
   
@@ -37,25 +37,16 @@ policy:
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
-
-  crop_shape: [84, 84]
+  obs_as_global_cond: ${obs_as_global_cond}
+  crop_shape: [76, 76]
+  # crop_shape: null
+  diffusion_step_embed_dim: 128
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
   obs_encoder_group_norm: True
   eval_fixed_crop: True
-
-  n_layer: 8
-  n_cond_layers: 0  # >0: use transformer encoder for cond, otherwise use MLP
-  n_head: 4
-  n_emb: 256
-  p_drop_emb: 0.0
-  p_drop_attn: 0.3
-  causal_attn: True
-  time_as_cond: True # if false, use BERT like encoder only arch, time as input
-  obs_as_cond: ${obs_as_cond}
-
-  # 6 in 8: DP-T-D6-6-8 [[6, 8]], DP-T-D6-3-4 [[3, 4], [3, 4]];
-  # 4 in 8: DP-T-D4-4-8 [[4, 8]], DP-T-D4-2-4 [[2, 4], [2, 4]], DP-T-D4-1-2 [[1, 2], [1, 2], [1, 2], [1, 2]];
-  # 2 in 8: DP-T-D2-2-8 [[2, 8]], DP-T-D2-1-4 [[1, 4], [1, 4]]
-  groups: [[6, 8]] 
 
   # scheduler.step params
   # predict_epsilon: True
@@ -83,11 +74,11 @@ val_dataloader:
   persistent_workers: False
 
 optimizer:
-  transformer_weight_decay: 1.0e-3
-  obs_encoder_weight_decay: 1.0e-6
-  gumbel_gates_lr_scale: 10.0
-  learning_rate: 1.0e-4
-  betas: [0.9, 0.95]
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
 
 training:
   device: "cuda:0"
@@ -96,8 +87,7 @@ training:
   resume: True
   # optimization
   lr_scheduler: cosine
-  # Transformer needs LR warmup
-  lr_warmup_steps: 1000
+  lr_warmup_steps: 500
   num_epochs: 3050
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm
@@ -120,12 +110,6 @@ training:
   # lora
   lora_rank: 8
   lora: False # if True, enable lora
-  # pretrained model
-  pretrain:
-    pretrained_model_path: data/experiments/image/pusht/diffusion_policy_transformer/train_0/checkpoints/epoch=0100-test_mean_score=0.748.ckpt
-    use_ema: True
-    exclude_keys: ['optimizer']
-    include_keys: ['model', 'ema_model']
 
 logging:
   project: diffusion_policy_prune

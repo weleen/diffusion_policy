@@ -20,7 +20,7 @@ import tqdm
 import numpy as np
 import shutil
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
-from diffusion_policy.policy.diffusion_light_transformer_hybrid_image_policy import DiffusionLightTransformerHybridImagePolicy
+from diffusion_policy.policy.diffusion_light_unet_hybrid_image_policy import DiffusionLightUnetHybridImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
@@ -29,12 +29,9 @@ from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
-import logging
-logger = logging.getLogger(__name__)
-
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
+class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -47,14 +44,15 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
         random.seed(seed)
 
         # configure model
-        self.model: DiffusionLightTransformerHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
+        self.model: DiffusionLightUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
 
-        self.ema_model: DiffusionLightTransformerHybridImagePolicy = None
+        self.ema_model: DiffusionLightUnetHybridImagePolicy = None
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
         # configure training state
-        self.optimizer = self.model.get_optimizer(**cfg.optimizer)
+        self.optimizer = hydra.utils.instantiate(
+            cfg.optimizer, params=self.model.parameters())
 
         # configure training state
         self.global_step = 0
@@ -69,22 +67,6 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
-
-        if cfg.training.pretrain.pretrained_model_path:
-            pretrained_model_path = pathlib.Path(cfg.training.pretrain.pretrained_model_path)
-            assert pretrained_model_path.is_file(), f"Pretrained model {pretrained_model_path} does not exist, check the path!"
-            print(f"Loading pretrained model from {pretrained_model_path} with "
-                  f"include_keys = {cfg.training.pretrain.include_keys} and "
-                  f"exclude_keys = {cfg.training.pretrain.exclude_keys}")
-            import dill
-            payload = torch.load(pretrained_model_path.open('rb'), pickle_module=dill)
-            self.load_payload(payload,
-                              exclude_keys=cfg.training.pretrain.exclude_keys,
-                              include_keys=cfg.training.pretrain.include_keys,
-                              strict=False)
-            if cfg.training.pretrain.use_ema:
-                # initialize self.model with self.ema_model.state_dict()
-                self.model.load_state_dict(self.ema_model.state_dict())
 
         # configure dataset
         dataset: BaseImageDataset
@@ -114,12 +96,6 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
             last_epoch=self.global_step-1
         )
 
-        if cfg.training.debug:
-            cfg.task.env_runner.n_train = 2
-            cfg.task.env_runner.n_train_vis = 1
-            cfg.task.env_runner.n_test = 2
-            cfg.task.env_runner.n_test_vis = 1
- 
         # configure ema
         ema: EMAModel = None
         if cfg.training.use_ema:
@@ -158,7 +134,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
-        
+
         # save batch for sampling
         train_sampling_batch = None
 
@@ -171,75 +147,11 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
             cfg.training.val_every = 1
             cfg.training.sample_every = 1
 
-        # Log pruning decision at the beginning
-        if self.ema_model is not None:
-            print(f"Initial model pruning structure:")
-            model_to_log = self.ema_model if self.ema_model is not None else self.model
-            layer_offset = 0
-            initial_decisions = []
-            initial_conf = []
-            for gate, option in zip(model_to_log.model.gumbel_gates, model_to_log.model.options):
-                # Move tensors to the right device if needed
-                gate = gate.to(device)
-                option = option.to(device)
-                
-                # Get the current selection
-                selected = gate.max(1)[1].item()
-                mask = option[selected]
-                selected_layers = (mask.nonzero().cpu()+layer_offset).squeeze().tolist()
-                if not isinstance(selected_layers, list):
-                    selected_layers = [selected_layers]
-                
-                # Calculate confidence scores
-                initial_conf.append(max(torch.softmax(gate*model_to_log.model.scaling, dim=1).detach().cpu().tolist()[0]))
-                initial_decisions.extend(selected_layers)
-                layer_offset += option.size(1)
-            
-            logger.info(f"Initial selection decisions: {initial_decisions}")
-            logger.info(f"Initial selection confidence: {initial_conf}")
-            
-            # Also log to wandb if available
-            if wandb.run is not None:
-                wandb.run.summary["initial_selection_decisions"] = str(initial_decisions)
-                wandb.run.summary["initial_selection_confidence"] = str(initial_conf)
-
-        # get the pruned model
-        pruned_model = self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', 'pruned_model_epoch_0.ckpt'), device='cuda')
-
-        # run evaluation at the beggining
-        # original model
-        if self.ema_model is not None:
-            model_to_eval = self.ema_model
-        else:
-            model_to_eval = self.model
-        runner_log = env_runner.run(model_to_eval)
-        # log all
-        logger.info(f"Original model evaluation\n{runner_log}")
-
-        # initial pruned model
-        runner_log = env_runner.run(pruned_model)
-        # log all
-        logger.info(f"Initial pruned model evaluation\n{runner_log}")
-
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        total_steps = len(train_dataloader) * cfg.training.num_epochs
-
-        # Start training!
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
-                
-                # Update temperature and scaling parameters for Gumbel softmax
-                tau = cfg.training.tau_range[0] + (cfg.training.tau_range[1] - cfg.training.tau_range[0]) * self.global_step / max(total_steps - 1, 1)
-                scaling = cfg.training.scaling_range[0] + (cfg.training.scaling_range[1] - cfg.training.scaling_range[0]) * self.global_step / max(total_steps - 1, 1)
-                
-                self.model.model.tau = tau
-                self.model.model.scaling = scaling
-                if self.ema_model is not None:
-                    self.ema_model.model.tau = tau
-                    self.ema_model.model.scaling = scaling
-                
                 # ========= train for this epoch ==========
                 train_losses = list()
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
@@ -247,8 +159,6 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        # if cfg.training.debug:
-                        #     import pdb;pdb.set_trace()
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
@@ -275,9 +185,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                             'train_loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0],
-                            'tau': tau,
-                            'scaling': scaling
+                            'lr': lr_scheduler.get_last_lr()[0]
                         }
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
@@ -296,37 +204,10 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                 train_loss = np.mean(train_losses)
                 step_log['train_loss'] = train_loss
 
-                # Log pruning decisions
-                if self.ema_model is not None:
-                    model_to_log = self.ema_model
-                else:
-                    model_to_log = self.model
-
-                layer_offset = 0
-                decisions = []
-                conf = []
-                for gate, option in zip(model_to_log.model.gumbel_gates, model_to_log.model.options):
-                    selected = gate.max(1)[1].item()
-                    mask = option[selected]
-                    selected_layers = (mask.nonzero().cpu()+layer_offset).squeeze().tolist()
-                    if isinstance(selected_layers, int):
-                        selected_layers = [selected_layers]
-                    conf.append(max(torch.softmax(gate*model_to_log.model.scaling, dim=1).detach().cpu().tolist()[0]))
-                    decisions.extend(selected_layers)
-                    layer_offset += option.size(1)
-                step_log['selection_decisions'] = str(decisions)
-                step_log['selection_confidence'] = str(conf)
-                print(f"Selection decisions: {decisions}")
-                print(f"Selection confidence: {conf}")
-
-                # get the pruned model
-                pruned_model = self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', f'pruned_model_epoch_{self.epoch}.ckpt'), device='cuda')
-
                 # ========= eval for this epoch ==========
-                # policy = self.model
-                # if cfg.training.use_ema:
-                #     policy = self.ema_model
-                policy = pruned_model # use the pruned model for evaluation
+                policy = self.model
+                if cfg.training.use_ema:
+                    policy = self.ema_model
                 policy.eval()
 
                 # run rollout
@@ -343,7 +224,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = policy.compute_loss(batch)
+                                loss = self.model.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
@@ -403,64 +284,12 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                 self.global_step += 1
                 self.epoch += 1
 
-            self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', f'pruned_model_epoch_{self.epoch}.ckpt'), device='cuda')
-                
-    def save_pruned_model(self, output_path, device='cpu'):
-        """Save the pruned model based on the learned pruning decisions"""
-        if self.ema_model is None:
-            model = self.model
-        else:
-            model = self.ema_model
-
-        # Create a deep copy of the model to avoid modifying the original
-        pruned_model = copy.deepcopy(model)
-        pruned_model.to(device)
-
-        # Get pruning decisions
-        layer_offset = 0
-        kept_layers = []
-        for gate, option in zip(pruned_model.model.gumbel_gates, pruned_model.model.options):
-            selected = gate.max(1)[1].item()
-            mask = option[selected]
-            selected_layers = (mask.nonzero().cpu()+layer_offset).squeeze().tolist()
-            if isinstance(selected_layers, int):
-                selected_layers = [selected_layers]
-            kept_layers.extend(selected_layers)
-            layer_offset += option.size(1)
-
-        print(f"Saving pruned model with kept layers: {kept_layers}")
-
-        # Remove pruned layers from the model based on the architecture
-        # TODO: dirty hack, need to fix this
-        new_blocks = []
-        for i in range(model.model.decoder.num_layers):
-            if i in kept_layers:
-                new_blocks.append(model.model.decoder.layers[i])
-        # assemble the TransformerDecoderLayer
-        pruned_model.model.decoder.layers = torch.nn.ModuleList(new_blocks)
-        pruned_model.model.decoder.num_layers = len(kept_layers)
-        # remove the gumbel gates
-        del pruned_model.model.gumbel_gates
-        
-        # Save the pruned model state dict
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        torch.save({
-            'model': self.model.state_dict(),
-            'ema_model': self.ema_model.state_dict(),
-            'pruned_model': pruned_model.state_dict(),
-            'kept_layers': kept_layers,
-            'normalizer': self.model.normalizer.state_dict()
-        }, output_path)
-        print(f"Saved pruned model to {output_path}")
-        # TODO: Remove pruned layers from the model based on the architecture
-        return pruned_model
-
 @hydra.main(
     version_base=None,
     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
     config_name=pathlib.Path(__file__).stem)
 def main(cfg):
-    workspace = TrainDiffusionLightTransformerHybridWorkspace(cfg)
+    workspace = TrainDiffusionUnetHybridWorkspace(cfg)
     workspace.run()
 
 if __name__ == "__main__":

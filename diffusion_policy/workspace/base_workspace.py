@@ -8,7 +8,9 @@ from omegaconf import OmegaConf
 import dill
 import torch
 import threading
+import logging
 
+logger = logging.getLogger(__name__)
 
 class BaseWorkspace:
     include_keys = tuple()
@@ -81,7 +83,15 @@ class BaseWorkspace:
 
         for key, value in payload['state_dicts'].items():
             if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
+                try:
+                    m, u = self.__dict__[key].load_state_dict(value, **kwargs)
+                    if len(m) > 0:
+                        logger.warning(f"Missing keys in {key}: {m}")
+                    if len(u) > 0:
+                        logger.warning(f"Unexpected keys in {key}: {u}")
+                except Exception as e:
+                    logger.error(f"Error loading state_dict for {key}: {e}")
+                    
         for key in include_keys:
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])

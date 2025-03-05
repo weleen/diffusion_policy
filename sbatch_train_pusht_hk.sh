@@ -67,6 +67,7 @@ conda activate robodiff
 
 # Run the training script with full path
 srun --ntasks=1 --ntasks-per-node=1 --cpus-per-task=20 --gres=gpu:1 \
-    python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+    python train.py --config-dir=. --config-name=train_diffusion_light_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/prune_by_learning/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+    # python train.py --config-dir=. --config-name=train_diffusion_transformer_hybrid_workspace.yaml task=pusht_image hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
 echo "The end time is: `date +"%Y-%m-%d %H:%M:%S"` | tee -a $LOG_FILE"

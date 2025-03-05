@@ -18,7 +18,7 @@ import dill
 import hydra
 import diffusers
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Union
+from typing import Dict, Any, Optional, List, Tuple, Union, Callable
 
 import robomimic.utils.tensor_utils as TensorUtils
 
@@ -123,6 +123,18 @@ def load_pretrained_model(
     policy.eval()  # Set to evaluation mode
     return policy
 
+def dict_apply(
+        x: Dict[str, torch.Tensor], 
+        func: Callable[[torch.Tensor], torch.Tensor]
+        ) -> Dict[str, torch.Tensor]:
+    result = dict()
+    for key, value in x.items():
+        if isinstance(value, dict):
+            result[key] = dict_apply(value, func)
+        else:
+            result[key] = func(value)
+    return result
+
 
 def _get_coreml_inputs(sample_inputs):
     return [
@@ -226,6 +238,165 @@ def convert_to_coreml(
 
     return coreml_model, output_path
 
+
+def convert_all_to_coreml(
+    model: BaseImagePolicy,
+    input_shapes: dict,
+    output_dir: str,
+    compute_unit: str = "ALL",
+    check_output_correctness: bool = False,
+) -> str:
+    """
+    Convert all components of the BaseImagePolicy to CoreML.
+    examples/diffusion_policy/diffusion_policy/policy/diffusion_transformer_hybrid_image_policy.py
+    """
+    logger.info("Converting all components to CoreML...")
+
+    # Define output path
+    output_path = _get_out_path(output_dir, "All")
+
+    if os.path.exists(output_path):
+        logger.info(
+            f"`All` already exists at {output_path}, skipping conversion."
+        )
+        return
+    
+    # Convert all components to an mlpackage
+    # including the obs_encoder and the diffusion transformer hybrid image policy
+    policy = model.to(torch.float32)
+    policy.obs_encoder.to(torch.float32)
+    policy.model.to(torch.float32)
+    policy.normalizer.to(torch.float32)
+    # policy.eval()
+    for param in policy.obs_encoder.obs_nets['image'].nets.parameters():
+        param.requires_grad = False
+    for param in policy.model.parameters():
+        param.requires_grad = False
+
+    # Define input shapes for policy
+    # bs = input_shapes["bs"]
+    policy_inputs = {
+        # for obs_encoder
+        "agent_pos": torch.randint(0, 512, size=input_shapes["agent_pos"]).to(torch.float32),  # (batch_size, 2, 2)
+        "image": torch.randn(input_shapes["image"], dtype=torch.float32).clamp(0, 1), # agent-view image, (0, 1)
+        # for diffusion transformer hybrid image policy
+        # "trajectory": torch.randn(
+        #     bs, input_shapes["horizon"], input_shapes["action_dim"]),
+        # "cond_data": torch.zeros(
+        #     size=(bs, input_shapes["horizon"], input_shapes["action_dim"]),
+        #     dtype=torch.float32),
+        # "cond_mask": torch.zeros(
+        #     size=(bs, input_shapes["horizon"], input_shapes["action_dim"]),
+        #     dtype=torch.bool),
+        # "cond": torch.randn(
+        #     bs, input_shapes["n_obs_steps"], input_shapes["obs_feature_dim"]),
+    }
+    policy_inputs_spec = {k: (v.shape, v.dtype) for k, v in policy_inputs.items()}
+    logger.info(f"Policy sample inputs spec: {policy_inputs_spec}")
+
+    # Define a wrapper for the policy
+    class PolicyWrapper(torch.nn.Module):
+        def __init__(self, policy):
+            super().__init__()
+            # components
+            self.policy = policy
+            self.obs_encoder = policy.obs_encoder
+            self.model = policy.model
+            self.noise_scheduler = policy.noise_scheduler
+            self.num_inference_steps = policy.num_inference_steps
+            self.normalizer = policy.normalizer
+
+            # hyperparameters
+            self.horizon = policy.horizon
+            self.action_dim = policy.action_dim
+            self.obs_feature_dim = policy.obs_feature_dim
+            self.n_obs_steps = policy.n_obs_steps
+            self.pred_action_steps_only = policy.pred_action_steps_only
+            self.n_action_steps = policy.n_action_steps
+
+        def forward(self, agent_pos, image):
+            # unwrap predict_action function.
+            obs_dict = {
+                "agent_pos": agent_pos,
+                "image": image,
+            }
+            nobs = self.normalizer.normalize(obs_dict)
+            B, To = agent_pos.shape[:2]
+            T = self.horizon
+            Da = self.action_dim
+            Do = self.obs_feature_dim
+            To = self.n_obs_steps
+
+            # process obs with obs encoder
+            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1, *x.shape[2:]))
+            nobs_features = self.obs_encoder(this_nobs)
+            # reshape back to B, To, Do
+            cond = nobs_features.reshape(B, To, -1)
+            shape = (B, T, Da)
+            if self.pred_action_steps_only:
+                shape = (B, self.n_action_steps, Da)
+            cond_data = torch.zeros(size=shape, dtype=torch.float32)
+            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+            
+            # run sampling
+            nsample = self.policy.conditional_sample(cond_data, cond_mask, cond)
+        
+            # unnormalize prediction
+            naction_pred = nsample[...,:Da]
+            action_pred = self.normalizer['action'].unnormalize(naction_pred)
+
+            # get action
+            if self.pred_action_steps_only:
+                action = action_pred
+            else:
+                start = To - 1
+                end = start + self.n_action_steps
+                action = action_pred[:,start:end]
+
+            return action, action_pred
+
+    # test the policy wrapper
+    logger.info("Checking model dimensions...")
+    test_policy_wrapper = PolicyWrapper(policy).eval()
+    with torch.no_grad():
+        test_out = test_policy_wrapper(
+            policy_inputs["agent_pos"],
+            policy_inputs["image"],
+        )
+        print(f"Test output shape: ({test_out[0].shape}, {test_out[1].shape})")
+    logger.info("Checking model dimensions done.")
+    # test the policy wrapper done.
+
+    reference_policy_wrapper = PolicyWrapper(policy).eval()
+    logger.info(f"JIT tracing reference policy wrapper...")
+    traced_reference_policy_wrapper = torch.jit.trace(
+        reference_policy_wrapper, 
+        (policy_inputs["agent_pos"].to(torch.float32),
+         policy_inputs["image"].to(torch.float32)),
+        # check_trace=False
+    )
+    logger.info(f"JIT tracing reference policy wrapper done")
+
+    # Add debug prints before the conversion
+    print("Agent pos shape:", policy_inputs["agent_pos"].shape)
+    print("Image shape:", policy_inputs["image"].shape)
+
+    # Also check the model's linear layer weights
+    for name, param in reference_policy_wrapper.named_parameters():
+        if 'weight' in name:
+            print(f"{name} shape:", param.shape)
+
+    # Convert to CoreML
+    return convert_to_coreml(
+        submodule_name="Policy",
+        torchscript_module=traced_reference_policy_wrapper,
+        sample_inputs=policy_inputs,
+        output_names=["action", "action_pred"],
+        output_dir=output_dir,
+        compute_unit=compute_unit,
+        check_output_correctness=check_output_correctness,
+    )
+    
 
 def convert_obs_encoder_to_coreml(
     model: BaseImagePolicy,
@@ -388,7 +559,7 @@ def convert_diffusion_transformer_hybrid_image_policy_to_coreml(
     print(f"sum(p.numel() for p in transformer.parameters() if p.requires_grad): {sum(p.numel() for p in transformer.parameters() if p.requires_grad)}")
 
     # Define input shapes for visual model
-    bs = 1
+    bs = input_shapes["bs"]
     transformer_inputs = {
         "trajectory": torch.randn(
             bs, input_shapes["horizon"], input_shapes["action_dim"]),
@@ -614,26 +785,31 @@ def convert_diffusion_transformer_hybrid_image_policy_to_coreml(
         check_output_correctness=check_output_correctness,
     )
 
-
-# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --num-inference-steps 10
-# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d6_mlpackage --n-layer 6 --strict-loading False --num-inference-steps 10
+# In the original implementation, the model is inferenced with 100 ddpm steps, so the compilation time is long, stay tuned.
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --convert-all True
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --num-inference-steps 10 --convert-all True # debug
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d6_mlpackage --n-layer 6 --strict-loading False --convert-all True
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d4_mlpackage --n-layer 4 --strict-loading False --convert-all True
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d2_mlpackage --n-layer 2 --strict-loading False --convert-all True
 @click.command()
 @click.option("--checkpoint", type=str, required=True)
 @click.option("--n-layer", type=int, default=8)
-@click.option("--num-inference-steps", type=int, default=1000)
+@click.option("--num-inference-steps", type=int, default=100)
 @click.option("--strict-loading", type=bool, default=True)
-@click.option("--convert-obs-encoder", type=bool, default=True)
-@click.option("--convert-model", type=bool, default=True)
+@click.option("--convert-all", type=bool, default=False)
+@click.option("--convert-obs-encoder", type=bool, default=False)
+@click.option("--convert-model", type=bool, default=False)
 @click.option("--output-dir", type=str, default="mlpackage/dp_mlpackage")
 @click.option("--check-output-correctness", type=bool, default=False)
 @click.option("--compute-unit", type=str, default="ALL")
-@click.option("--clean-output-dir", type=bool, default=True)
+@click.option("--clean-output-dir", type=bool, default=False)
 @click.option("--bundle-resources", type=bool, default=False)
 def main(checkpoint: str,
          n_layer: int,
          num_inference_steps: int,
          strict_loading: bool,
          output_dir: str,
+         convert_all: bool,
          convert_obs_encoder: bool, 
          convert_model: bool, 
          check_output_correctness: bool, 
@@ -666,6 +842,8 @@ def main(checkpoint: str,
     # Get input shapes from config
     bs = 1
     input_shapes = {
+        "bs": bs,
+        "window_size": 512, # agent position window size
         "image_size": 96,
         "agent_pos": (bs, 2, 2), # agent position
         "image": (bs, 2, 3, 96, 96), # agent-view image, (0, 1)
@@ -678,6 +856,19 @@ def main(checkpoint: str,
 
     # Convert requested components
     converted_models = {}
+
+    if convert_all:
+        logger.info("Converting all components to CoreML...")
+        converted_models["all"] = convert_all_to_coreml(
+            model=model,
+            input_shapes=input_shapes,
+            output_dir=output_dir,
+            compute_unit=compute_unit,
+            check_output_correctness=check_output_correctness,
+        )
+        logger.info(
+            f"All components converted and saved to {converted_models['all']}"
+        )
 
     if convert_obs_encoder:
         logger.info("Converting Language Goal model to CoreML...")

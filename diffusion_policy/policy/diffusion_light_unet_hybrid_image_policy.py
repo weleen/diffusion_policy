@@ -1,15 +1,14 @@
-from typing import Dict, Tuple
+from typing import Dict
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce
-
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
-from diffusion_policy.model.diffusion.light_transformer_for_diffusion import LightTransformerForDiffusion
+from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.common.robomimic_config_util import get_robomimic_config
 from robomimic.algo import algo_factory
@@ -20,32 +19,23 @@ import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
 
-class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
+class DiffusionLightUnetHybridImagePolicy(BaseImagePolicy):
     def __init__(self, 
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
-            # task params
             horizon, 
             n_action_steps, 
             n_obs_steps,
             num_inference_steps=None,
-            # image
+            obs_as_global_cond=True,
             crop_shape=(76, 76),
+            diffusion_step_embed_dim=256,
+            down_dims=(256,512,1024),
+            kernel_size=5,
+            n_groups=8,
+            cond_predict_scale=True,
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
-            # arch
-            n_layer=8,
-            n_cond_layers=0,
-            n_head=4,
-            n_emb=256,
-            p_drop_emb=0.0,
-            p_drop_attn=0.3,
-            causal_attn=True,
-            time_as_cond=True,
-            obs_as_cond=True,
-            pred_action_steps_only=False,
-            # learning by prune
-            groups = [[1, 2] for _ in range(4)], # remove 1 in each group with 2 blocks, [6, 8], [4, 8], [2, 8]
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -80,7 +70,7 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
             hdf5_type='image',
             task_name='square',
             dataset_type='ph')
-        # import pdb;pdb.set_trace()
+        
         with config.unlocked():
             # set config with shape_meta
             config.observation.modalities.obs = obs_config
@@ -138,26 +128,21 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
 
         # create diffusion model
         obs_feature_dim = obs_encoder.output_shape()[0]
-        input_dim = action_dim if obs_as_cond else (obs_feature_dim + action_dim)
-        output_dim = input_dim
-        cond_dim = obs_feature_dim if obs_as_cond else 0
+        input_dim = action_dim + obs_feature_dim
+        global_cond_dim = None
+        if obs_as_global_cond:
+            input_dim = action_dim
+            global_cond_dim = obs_feature_dim * n_obs_steps
 
-        model = LightTransformerForDiffusion(
+        model = ConditionalUnet1D(
             input_dim=input_dim,
-            output_dim=output_dim,
-            horizon=horizon,
-            n_obs_steps=n_obs_steps,
-            cond_dim=cond_dim,
-            n_layer=n_layer,
-            n_head=n_head,
-            n_emb=n_emb,
-            p_drop_emb=p_drop_emb,
-            p_drop_attn=p_drop_attn,
-            causal_attn=causal_attn,
-            time_as_cond=time_as_cond,
-            obs_as_cond=obs_as_cond,
-            n_cond_layers=n_cond_layers,
-            groups = groups
+            local_cond_dim=None,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=diffusion_step_embed_dim,
+            down_dims=down_dims,
+            kernel_size=kernel_size,
+            n_groups=n_groups,
+            cond_predict_scale=cond_predict_scale
         )
 
         self.obs_encoder = obs_encoder
@@ -165,7 +150,7 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
-            obs_dim=0 if (obs_as_cond) else obs_feature_dim,
+            obs_dim=0 if obs_as_global_cond else obs_feature_dim,
             max_n_obs_steps=n_obs_steps,
             fix_obs_steps=True,
             action_visible=False
@@ -176,20 +161,21 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         self.action_dim = action_dim
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
-        self.obs_as_cond = obs_as_cond
-        self.pred_action_steps_only = pred_action_steps_only
+        self.obs_as_global_cond = obs_as_global_cond
         self.kwargs = kwargs
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
-        self.groups = groups
 
+        print("Diffusion params: %e" % sum(p.numel() for p in self.model.parameters()))
+        print("Vision params: %e" % sum(p.numel() for p in self.obs_encoder.parameters()))
     
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,
-            cond=None, generator=None,
+            local_cond=None, global_cond=None,
+            generator=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -210,7 +196,8 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, cond)
+            model_output = model(trajectory, t, 
+                local_cond=local_cond, global_cond=global_cond)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -245,18 +232,16 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         dtype = self.dtype
 
         # handle different ways of passing observation
-        cond = None
-        cond_data = None
-        cond_mask = None
-        if self.obs_as_cond:
+        local_cond = None
+        global_cond = None
+        if self.obs_as_global_cond:
+            # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, To, Do
-            cond = nobs_features.reshape(B, To, -1)
-            shape = (B, T, Da)
-            if self.pred_action_steps_only:
-                shape = (B, self.n_action_steps, Da)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
+            # reshape back to B, Do
+            global_cond = nobs_features.reshape(B, -1)
+            # empty data for action
+            cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
@@ -264,8 +249,7 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, To, Do
             nobs_features = nobs_features.reshape(B, To, -1)
-            shape = (B, T, Da+Do)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
+            cond_data = torch.zeros(size=(B, T, Da+Do), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
@@ -274,7 +258,8 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
-            cond=cond,
+            local_cond=local_cond,
+            global_cond=global_cond,
             **self.kwargs)
         
         # unnormalize prediction
@@ -282,12 +267,9 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
-        if self.pred_action_steps_only:
-            action = action_pred
-        else:
-            start = To - 1
-            end = start + self.n_action_steps
-            action = action_pred[:,start:end]
+        start = To - 1
+        end = start + self.n_action_steps
+        action = action_pred[:,start:end]
         
         result = {
             'action': action,
@@ -299,68 +281,37 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
-    def get_optimizer(
-            self, 
-            transformer_weight_decay: float, 
-            obs_encoder_weight_decay: float,
-            gumbel_gates_lr_scale: float,
-            learning_rate: float, 
-            betas: Tuple[float, float]
-        ) -> torch.optim.Optimizer:
-        optim_groups = self.model.get_optim_groups(
-            weight_decay=transformer_weight_decay,
-            ignore_keys=['gumbel_gates'])
-        optim_groups.append({
-            "params": self.obs_encoder.parameters(),
-            "weight_decay": obs_encoder_weight_decay
-        })
-        optim_groups.append({
-            "params": self.model.gumbel_gates.parameters(),
-            "weight_decay": 0.0, # gumbel gates will not be weight decayed
-            "lr": learning_rate * gumbel_gates_lr_scale
-        })
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas
-        )
-        return optimizer
-
     def compute_loss(self, batch):
         # normalize input
-        # import pdb;pdb.set_trace()
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
-        To = self.n_obs_steps
 
         # handle different ways of passing observation
-        cond = None
+        local_cond = None
+        global_cond = None
         trajectory = nactions
-        if self.obs_as_cond:
+        cond_data = trajectory
+        if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
-                lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+                lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, T, Do
-            cond = nobs_features.reshape(batch_size, To, -1)
-            if self.pred_action_steps_only:
-                start = To - 1
-                end = start + self.n_action_steps
-                trajectory = nactions[:,start:end]
+            # reshape back to B, Do
+            global_cond = nobs_features.reshape(batch_size, -1)
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
-            trajectory = torch.cat([nactions, nobs_features], dim=-1).detach()
+            cond_data = torch.cat([nactions, nobs_features], dim=-1)
+            trajectory = cond_data.detach()
 
         # generate impainting mask
-        if self.pred_action_steps_only:
-            condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
-        else:
-            condition_mask = self.mask_generator(trajectory.shape)
+        condition_mask = self.mask_generator(trajectory.shape)
 
         # Sample noise that we'll add to the images
         noise = torch.randn(trajectory.shape, device=trajectory.device)
@@ -374,15 +325,16 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         # (this is the forward diffusion process)
         noisy_trajectory = self.noise_scheduler.add_noise(
             trajectory, noise, timesteps)
-
+        
         # compute loss mask
         loss_mask = ~condition_mask
 
         # apply conditioning
-        noisy_trajectory[condition_mask] = trajectory[condition_mask]
+        noisy_trajectory[condition_mask] = cond_data[condition_mask]
         
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
+        pred = self.model(noisy_trajectory, timesteps, 
+            local_cond=local_cond, global_cond=global_cond)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -396,4 +348,4 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
-        return loss 
+        return loss
