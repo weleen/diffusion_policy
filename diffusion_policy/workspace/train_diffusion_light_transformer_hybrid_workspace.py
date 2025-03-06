@@ -19,6 +19,8 @@ import wandb
 import tqdm
 import numpy as np
 import shutil
+from typing import List, Generator
+from itertools import accumulate
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.diffusion_light_transformer_hybrid_image_policy import DiffusionLightTransformerHybridImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
@@ -33,6 +35,39 @@ import logging
 logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def extract_into_tensor(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+class DDIMSolver:
+    def __init__(self, alpha_cumprods: np.ndarray, timesteps: int = 1000, ddim_timesteps: int = 50) -> None:
+        # DDIM sampling parameters
+        step_ratio = timesteps // ddim_timesteps
+        self.ddim_timesteps = (np.arange(1, ddim_timesteps + 1) * step_ratio).round().astype(np.int64) - 1
+        self.ddim_alpha_cumprods = alpha_cumprods[self.ddim_timesteps]
+        self.ddim_alpha_cumprods_prev = np.asarray(
+            [alpha_cumprods[0]] + alpha_cumprods[self.ddim_timesteps[:-1]].tolist()
+        )
+        # convert to torch tensors
+        self.ddim_timesteps = torch.from_numpy(self.ddim_timesteps).long()
+        self.ddim_alpha_cumprods = torch.from_numpy(self.ddim_alpha_cumprods)
+        self.ddim_alpha_cumprods_prev = torch.from_numpy(self.ddim_alpha_cumprods_prev)
+
+    def to(self, device: torch.device) -> "DDIMSolver":
+        self.ddim_timesteps = self.ddim_timesteps.to(device)
+        self.ddim_alpha_cumprods = self.ddim_alpha_cumprods.to(device)
+        self.ddim_alpha_cumprods_prev = self.ddim_alpha_cumprods_prev.to(device)
+        return self
+
+    def ddim_step(self, pred_x0: torch.Tensor, pred_noise: torch.Tensor,
+                  timestep_index: torch.Tensor) -> torch.Tensor:
+        alpha_cumprod_prev = extract_into_tensor(self.ddim_alpha_cumprods_prev, timestep_index, pred_x0.shape)
+        dir_xt = (1.0 - alpha_cumprod_prev).sqrt() * pred_noise
+        x_prev = alpha_cumprod_prev.sqrt() * pred_x0 + dir_xt
+        return x_prev
 
 class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
@@ -51,6 +86,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
         self.model: DiffusionLightTransformerHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
 
         self.ema_model: DiffusionLightTransformerHybridImagePolicy = None
+        assert cfg.training.use_ema, "set use_ema to True to use EMA"
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
@@ -101,7 +137,35 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
+        self.raw_model = copy.deepcopy(self.model) # this is the original model, used as a teacher model
+    
+        # device transfer
+        device = torch.device(cfg.training.device)
+        self.model.to(device)
+        self.raw_model.eval()
+        self.raw_model.requires_grad_(False)
+        self.raw_model.to(device)
 
+        noise_scheduler = self.model.noise_scheduler
+        alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
+        sigma_schedule = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
+
+        solver = DDIMSolver(
+            noise_scheduler.alphas_cumprod.numpy(),
+            timesteps=noise_scheduler.config.num_train_timesteps,
+            ddim_timesteps=cfg.policy.num_inference_steps,
+        )
+
+        encoder = self.model.obs_encoder
+        teacher_model = self.ema_model.model
+
+        encoder.requires_grad_(False)
+        teacher_model.requires_grad_(False)
+        # Also move the alpha and sigma noise schedules to device
+        alpha_schedule = alpha_schedule.to(device)
+        sigma_schedule = sigma_schedule.to(device)
+        solver = solver.to(device)
+        
         # configure lr scheduler
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
@@ -204,6 +268,145 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                 wandb.run.summary["initial_selection_decisions"] = str(initial_decisions)
                 wandb.run.summary["initial_selection_confidence"] = str(initial_conf)
 
+        # calculate importance score
+        if self.ema_model is not None:
+            model_for_score = self.ema_model
+        else:
+            model_for_score = self.model
+
+        def calculate_biscore(model, data_loader):
+            # register hooks to the model
+            @torch.no_grad()
+            def compute_BI_score(module, inputs, outputs):
+                # N, L, D 
+                out_state = outputs
+                in_state = inputs[0]
+                cosine_sim = torch.nn.functional.cosine_similarity(out_state, in_state, dim=-1).mean().cpu()
+                if hasattr(module, 'BI_score'):
+                    module.BI_score.append(cosine_sim)
+                else:
+                    module.BI_score = [cosine_sim]
+            hooks = []
+            for layer in model.model.decoder.layers:
+                hooks.append(layer.register_forward_hook(compute_BI_score))
+            # iterate over the data loader
+            for batch in data_loader:
+                # device transfer
+                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                # forward pass
+                model.compute_loss(batch)
+                if cfg.training.debug:
+                    break
+
+            # collect scores
+            layer_scores = []
+            for layer in model.model.decoder.layers:
+                layer_scores.append( sum(layer.BI_score) / len(layer.BI_score) )
+            layer_scores = torch.tensor(layer_scores)
+            # remove hooks
+            for hook in hooks:
+                hook.remove()
+            # topk layers are less important
+            return layer_scores
+
+        def calculate_svdscore(model):
+            @torch.no_grad()
+            def compute_svd_diff(weight, partial_topk=0.5, topk=128, energy_threshold=0.9): # 0.95 for recoverability
+                # compute the svd of the weight
+                u, s, v = torch.svd(weight)
+                # keep the topk singular values based on the energy
+                energy = torch.sum(s**2)
+                energy_cumsum = torch.cumsum(s**2, dim=0)
+                topk_idx = torch.sum(energy_cumsum < energy * energy_threshold)
+                # get the topk singular values
+                topk = int(min(partial_topk * s.size(0), topk_idx, topk))
+                topk_s = s.topk(topk).values
+                # fill the rest with 0
+                new_s = torch.zeros_like(s)
+                new_s[:topk] = topk_s
+                # compute the difference between the svd and the weight
+                diff = torch.norm(weight - u @ torch.diag(new_s) @ v.t())
+                return diff
+
+            # Directly access transformer decoder layers
+            scores = []
+            for layer in model.model.decoder.layers:
+                assert isinstance(layer, torch.nn.TransformerDecoderLayer)
+                # get the parameters of the self_attn, multihead_attn, and ffn
+                self_attn = layer.self_attn
+                multihead_attn = layer.multihead_attn
+                to_q, to_k, to_v = self_attn.in_proj_weight.chunk(3, dim=0)
+                # compute SVD differences for self attention
+                diff_sa_q = compute_svd_diff(to_q)
+                diff_sa_k = compute_svd_diff(to_k)
+                diff_sa_v = compute_svd_diff(to_v)
+                to_q, to_k, to_v = multihead_attn.in_proj_weight.chunk(3, dim=0)
+                # compute SVD differences for multihead attention
+                diff_ma_q = compute_svd_diff(to_q)
+                diff_ma_k = compute_svd_diff(to_k)
+                diff_ma_v = compute_svd_diff(to_v)
+                
+                # compute SVD differences for feed forward network
+                diff_ffn1 = compute_svd_diff(layer.linear1.weight)
+                diff_ffn2 = compute_svd_diff(layer.linear2.weight)
+                
+                # sum up all differences for this layer
+                layer_score = (diff_sa_q + diff_sa_k + diff_sa_v + 
+                             diff_ma_q + diff_ma_k + diff_ma_v + 
+                             diff_ffn1 + diff_ffn2).item()
+                scores.append(layer_score)
+            layer_scores = torch.tensor(scores)
+            return layer_scores
+
+        def calculate_importance_score(model, data_loader, importance_score_type, fixed_importance_score):
+            if importance_score_type == "biscore":
+                # calculate biscore
+                importance_score = calculate_biscore(
+                    model, data_loader)
+                # importance_score = torch.ones(model.model.decoder.num_layers)
+            elif importance_score_type == "svdscore":
+                # calculate svdscore
+                importance_score = calculate_svdscore(
+                    model)
+            elif importance_score_type == "fixed":
+                # use fixed importance score
+                importance_score = fixed_importance_score * torch.ones(model.model.decoder.num_layers)
+            elif importance_score_type == "random":
+                # use random importance score
+                importance_score = torch.rand(model.model.decoder.num_layers)
+            else:
+                raise ValueError(f"Invalid importance score type: {cfg.policy.importance_score_type}")
+            return importance_score
+
+        # calculate importance score
+        # for type in ["biscore", "svdscore", "fixed", "random"]:
+        importance_score: torch.Tensor = calculate_importance_score(
+            model_for_score,
+            train_dataloader,
+            cfg.policy.importance_score_type,
+            cfg.policy.fixed_importance_score)
+        print(f"Importance score type: {cfg.policy.importance_score_type}, score: {importance_score.cpu().tolist()}")
+
+        # reset the gumbel_gates
+        gates = self.model.model.gumbel_gates
+        options = self.model.model.options
+        # for each gate, set the value based on the importance score
+        new_gates = copy.deepcopy(gates)
+        # normalize the importance score
+        importance_score = importance_score / importance_score.sum()
+        groups = self.model.groups
+        cum_groups = [0] + list(accumulate(group[1] for group in groups))
+        for i, gate, option in zip(range(len(gates)), gates, options):
+            # print(f"gate: {gate}, option: {option}")
+            for j in range(len(option)):
+                # get the probability of each option
+                prob = (option[j] * importance_score[cum_groups[i]:cum_groups[i+1]]).sum()
+                # print(f"prob: {prob}")
+                new_gates[i][0][j].data.copy_(prob)
+        # print(f"gates: {gates}\n")
+        # print(f"new_gates: {new_gates}\n")
+        self.model.model.gumbel_gates = new_gates
+
         # get the pruned model
         pruned_model = self.save_pruned_model(os.path.join(self.output_dir, 'checkpoints', 'pruned_model_epoch_0.ckpt'), device=device)
 
@@ -257,8 +460,10 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
+                        # pass the denoiser of the raw model as a teacher model, and the denoiser of the ema model as a second teacher model.
+                        # the obs_encoder of the ema_model will not be ema updated.
+                        train_loss = self.model.compute_loss(batch, self.raw_model.model, self.ema_model.model, solver)
+                        loss = train_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
                         # step optimizer
@@ -270,13 +475,15 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                         # update ema
                         if cfg.training.use_ema:
                             ema.step(self.model)
+                            # reset encoder, no ema for encoder
+                            self.ema_model.obs_encoder = copy.deepcopy(self.model.obs_encoder)
 
                         # logging
-                        raw_loss_cpu = raw_loss.item()
-                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
-                        train_losses.append(raw_loss_cpu)
+                        train_loss_cpu = train_loss.item()
+                        tepoch.set_postfix(loss=train_loss_cpu, refresh=False)
+                        train_losses.append(train_loss_cpu)
                         step_log = {
-                            'train_loss': raw_loss_cpu,
+                            'train_loss': train_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0],
@@ -354,7 +561,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = policy.compute_loss(batch)
+                                loss = policy.compute_loss(batch, self.raw_model.model, self.ema_model.model, solver)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
@@ -414,7 +621,6 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                 self.global_step += 1
                 self.epoch += 1
 
-                
     def save_pruned_model(self, output_path, device='cpu', save=True):
         """Save the pruned model based on the learned pruning decisions"""
         if self.ema_model is None:

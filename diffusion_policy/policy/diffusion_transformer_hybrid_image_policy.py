@@ -43,6 +43,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             time_as_cond=True,
             obs_as_cond=True,
             pred_action_steps_only=False,
+            cfg_scale=1.1,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -174,6 +175,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.n_obs_steps = n_obs_steps
         self.obs_as_cond = obs_as_cond
         self.pred_action_steps_only = pred_action_steps_only
+        self.cfg_scale = cfg_scale
         self.kwargs = kwargs
 
         if num_inference_steps is None:
@@ -270,6 +272,13 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             cond_mask,
             cond=cond,
             **self.kwargs)
+        uncond_nsample = self.conditional_sample(
+            cond_data, 
+            cond_mask,
+            cond=torch.zeros_like(cond),
+            **self.kwargs)
+        print(f"cfg_scale: {self.cfg_scale}")
+        nsample = uncond_nsample + self.cfg_scale * (nsample - uncond_nsample)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]

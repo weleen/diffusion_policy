@@ -267,29 +267,30 @@ def convert_all_to_coreml(
     policy.obs_encoder.to(torch.float32)
     policy.model.to(torch.float32)
     policy.normalizer.to(torch.float32)
-    # policy.eval()
+    policy.obs_encoder.eval()
+    policy.obs_encoder.obs_nets['image'].nets.eval()
+    policy.model.eval()
+    policy.eval()
     for param in policy.obs_encoder.obs_nets['image'].nets.parameters():
         param.requires_grad = False
     for param in policy.model.parameters():
         param.requires_grad = False
 
     # Define input shapes for policy
-    # bs = input_shapes["bs"]
+    bs = input_shapes["bs"]
     policy_inputs = {
         # for obs_encoder
         "agent_pos": torch.randint(0, 512, size=input_shapes["agent_pos"]).to(torch.float32),  # (batch_size, 2, 2)
         "image": torch.randn(input_shapes["image"], dtype=torch.float32).clamp(0, 1), # agent-view image, (0, 1)
         # for diffusion transformer hybrid image policy
-        # "trajectory": torch.randn(
-        #     bs, input_shapes["horizon"], input_shapes["action_dim"]),
-        # "cond_data": torch.zeros(
-        #     size=(bs, input_shapes["horizon"], input_shapes["action_dim"]),
-        #     dtype=torch.float32),
-        # "cond_mask": torch.zeros(
-        #     size=(bs, input_shapes["horizon"], input_shapes["action_dim"]),
-        #     dtype=torch.bool),
-        # "cond": torch.randn(
-        #     bs, input_shapes["n_obs_steps"], input_shapes["obs_feature_dim"]),
+        "trajectory": torch.randn(
+            bs, input_shapes["horizon"], input_shapes["action_dim"]),
+        "cond_data": torch.zeros(
+            size=(bs, input_shapes["horizon"], input_shapes["action_dim"]),
+            dtype=torch.float32),
+        "cond_mask": torch.zeros(
+            size=(bs, input_shapes["horizon"], input_shapes["action_dim"]),
+            dtype=torch.bool),
     }
     policy_inputs_spec = {k: (v.shape, v.dtype) for k, v in policy_inputs.items()}
     logger.info(f"Policy sample inputs spec: {policy_inputs_spec}")
@@ -302,8 +303,11 @@ def convert_all_to_coreml(
             self.policy = policy
             self.obs_encoder = policy.obs_encoder
             self.model = policy.model
-            self.noise_scheduler = policy.noise_scheduler
+            self.input_emb = self.model.input_emb
+            self.cond_obs_emb = self.model.cond_obs_emb
+            self.scheduler = policy.noise_scheduler
             self.num_inference_steps = policy.num_inference_steps
+            self.scheduler.set_timesteps(self.num_inference_steps)
             self.normalizer = policy.normalizer
 
             # hyperparameters
@@ -313,8 +317,142 @@ def convert_all_to_coreml(
             self.n_obs_steps = policy.n_obs_steps
             self.pred_action_steps_only = policy.pred_action_steps_only
             self.n_action_steps = policy.n_action_steps
+            self.n_dim = 256
 
-        def forward(self, agent_pos, image):
+        def forward_model(self, sample, timestep, cond):
+            """
+            x: (B,T,input_dim)
+            timestep: (B,) or int, diffusion step
+            cond: (B,T',cond_dim)
+            output: (B,T,input_dim)
+            """
+            if not torch.is_tensor(timestep):
+                # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+                timestep = torch.tensor([timestep], dtype=torch.long)
+            elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+                timestep = timestep.unsqueeze(0)
+            # # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            timesteps = timestep.expand(sample.shape[0])
+            # SinusoidalPosEmb from examples/diffusion_policy/diffusion_policy/model/diffusion/positional_embedding.py
+            time_emb = self.model.time_emb(timesteps).unsqueeze(1)
+            # (B,1,n_emb)
+
+            # process input
+            b = sample.shape[0]
+            # sample = einops.rearrange(sample, 'b to d -> (b to) d')
+            inpu_emb = self.input_emb(sample)
+            # inpu_emb = einops.rearrange(inpu_emb, '(b to) d -> b to d', b=b)
+            # inpu_emb = torch.zeros((*(sample.shape[:-1]), 256)) # debug, comment out
+
+            # encoder
+            cond_embeddings = time_emb
+            # if self.model.obs_as_cond: # True
+            # cond = einops.rearrange(cond, 'b to d -> (b to) d')
+            cond_obs_emb = self.cond_obs_emb(cond)
+            # cond_obs_emb = einops.rearrange(cond_obs_emb, '(b to) d -> b to d', b=b)
+            # cond_obs_emb = torch.zeros((*(cond.shape[:-1]), 256))
+            # (B,To,n_emb)
+            cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
+
+            tc = cond_embeddings.shape[1]
+            position_embeddings = self.model.cond_pos_emb[:, :tc, :]  # each position maps to a (learnable) vector
+            x = self.model.drop(cond_embeddings + position_embeddings)
+            x = self.model.encoder(x)
+            memory = x
+            # (B,T_cond,n_emb)
+
+            # x = torch.zeros((b, 3, 256)) # debug, comment out
+            # memory = x
+            
+            # decoder
+            token_embeddings = inpu_emb
+            t = token_embeddings.shape[1]
+            position_embeddings = self.model.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
+            x = self.model.drop(token_embeddings + position_embeddings)
+            # (B,T,n_emb)
+            x = self.model.decoder(
+                tgt=x,
+                memory=memory,
+                tgt_mask=self.model.mask,
+                memory_mask=self.model.memory_mask
+            )
+            # (B,T,n_emb)
+
+            # x = torch.zeros((b, 10, 256)) # debug, comment out
+
+            # head
+            x = self.model.ln_f(x)
+            x = self.model.head(x)
+            # (B,T,n_out)
+            return x
+
+        def scheduler_step(self, model_output, timestep, sample, generator=None, **kwargs):
+            # return self.scheduler.step(model_output, t, trajectory, generator, return_dict, **kwargs).prev_sample
+
+            # 1. compute alphas, betas
+            t = timestep
+            alpha_prod_t = self.scheduler.alphas_cumprod[t]
+            alpha_prod_t_prev = self.scheduler.alphas_cumprod[t - 1] if t > 0 else torch.tensor(1.0)
+            beta_prod_t = 1 - alpha_prod_t
+            beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+            # 2. compute predicted original sample from predicted noise also called
+            # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+
+            # 3. Clip "predicted x_0"
+            if self.scheduler.clip_sample:
+                pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
+
+            # 4. Compute coefficients for pred_original_sample x_0 and current sample x_t
+            # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
+            pred_original_sample_coeff = (alpha_prod_t_prev ** (0.5) * self.scheduler.betas[t]) / beta_prod_t
+            current_sample_coeff = self.scheduler.alphas[t] ** (0.5) * beta_prod_t_prev / beta_prod_t
+
+            # 5. Compute predicted previous sample µ_t
+            # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
+            pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * sample
+
+            # 6. Add noise
+            variance = 0
+            if t > 0:
+                variance_noise = torch.randn(
+                    model_output.shape, generator=generator, dtype=model_output.dtype
+                )
+                if self.scheduler.variance_type == "fixed_small_log":
+                    variance = self.scheduler._get_variance(t, predicted_variance=None) * variance_noise
+                else:
+                    variance = (self.scheduler._get_variance(t, predicted_variance=None) ** 0.5) * variance_noise
+
+            pred_prev_sample = pred_prev_sample + variance
+
+            return pred_prev_sample
+
+        def conditional_sample(self, trajectory, cond_data, cond_mask, cond):
+            # unwrapper nsample = self.policy.conditional_sample(cond_data, cond_mask, cond)
+            for i, t in enumerate(self.scheduler.timesteps):
+                # print(f"ddpm step {i}")
+                # 1. apply conditioning
+                # cond_mask: (1,10,2), torch.bool, cond_data: (1,10,2), torch.float32
+                # trajectory[cond_mask] = cond_data[cond_mask] # ERROR - converting 'index_put_' op, replace by torch.where
+                trajectory = torch.where(cond_mask, cond_data, trajectory)
+
+                # 2. predict model output
+                # model_output = self.model(trajectory, t, cond) # ERROR - converting 'linear' op (located at: 'model/input_emb/input_emb.1'), unwrapping the function call
+                # examples/diffusion_policy/diffusion_policy/model/diffusion/transformer_for_diffusion.py
+                model_output = self.forward_model(trajectory, t, cond)
+                # model_output = torch.zeros_like(trajectory) # debug, replace with zeros
+
+                # 3. compute previous image: x_t -> x_t-1
+                # trajectory = self.scheduler.step(
+                #     model_output, t, trajectory,
+                # ).prev_sample # ERROR - converting 'sub' op (located at: '61'):
+                trajectory = self.scheduler_step(model_output, t, trajectory)
+
+            # trajectory[cond_mask] = cond_data[cond_mask] # ERROR - converting 'index_put_' op, replace by torch.where
+            trajectory = torch.where(cond_mask, cond_data, trajectory)
+            return trajectory
+        def forward(self, agent_pos, image, trajectory, cond_data, cond_mask):
             # unwrap predict_action function.
             obs_dict = {
                 "agent_pos": agent_pos,
@@ -332,14 +470,8 @@ def convert_all_to_coreml(
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, To, Do
             cond = nobs_features.reshape(B, To, -1)
-            shape = (B, T, Da)
-            if self.pred_action_steps_only:
-                shape = (B, self.n_action_steps, Da)
-            cond_data = torch.zeros(size=shape, dtype=torch.float32)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            
             # run sampling
-            nsample = self.policy.conditional_sample(cond_data, cond_mask, cond)
+            nsample = self.conditional_sample(trajectory, cond_data, cond_mask, cond)
         
             # unnormalize prediction
             naction_pred = nsample[...,:Da]
@@ -362,6 +494,9 @@ def convert_all_to_coreml(
         test_out = test_policy_wrapper(
             policy_inputs["agent_pos"],
             policy_inputs["image"],
+            policy_inputs["trajectory"],
+            policy_inputs["cond_data"],
+            policy_inputs["cond_mask"],
         )
         print(f"Test output shape: ({test_out[0].shape}, {test_out[1].shape})")
     logger.info("Checking model dimensions done.")
@@ -372,19 +507,25 @@ def convert_all_to_coreml(
     traced_reference_policy_wrapper = torch.jit.trace(
         reference_policy_wrapper, 
         (policy_inputs["agent_pos"].to(torch.float32),
-         policy_inputs["image"].to(torch.float32)),
+         policy_inputs["image"].to(torch.float32),
+         policy_inputs["trajectory"].to(torch.float32),
+         policy_inputs["cond_data"].to(torch.float32),
+         policy_inputs["cond_mask"].to(torch.bool),)
         # check_trace=False
     )
     logger.info(f"JIT tracing reference policy wrapper done")
 
-    # Add debug prints before the conversion
-    print("Agent pos shape:", policy_inputs["agent_pos"].shape)
-    print("Image shape:", policy_inputs["image"].shape)
+    # # Add debug prints before the conversion
+    # print("Agent pos shape:", policy_inputs["agent_pos"].shape)
+    # print("Image shape:", policy_inputs["image"].shape)
+    # print("Trajectory shape:", policy_inputs["trajectory"].shape)
+    # print("Cond data shape:", policy_inputs["cond_data"].shape)
+    # print("Cond mask shape:", policy_inputs["cond_mask"].shape)
 
-    # Also check the model's linear layer weights
-    for name, param in reference_policy_wrapper.named_parameters():
-        if 'weight' in name:
-            print(f"{name} shape:", param.shape)
+    # # Also check the model's linear layer weights
+    # for name, param in reference_policy_wrapper.named_parameters():
+    #     if 'weight' in name:
+    #         print(f"{name} shape:", param.shape)
 
     # Convert to CoreML
     return convert_to_coreml(
@@ -701,7 +842,7 @@ def convert_diffusion_transformer_hybrid_image_policy_to_coreml(
         def forward(self, trajectory, cond_data, cond_mask, cond):
             # # unwrapper nsample = self.policy.conditional_sample(cond_data, cond_mask, cond)
             for i, t in enumerate(self.scheduler.timesteps):
-                print(f"ddpm step {i}")
+                # print(f"ddpm step {i}")
                 # 1. apply conditioning
                 # cond_mask: (1,10,2), torch.bool
                 # cond_data: (1,10,2), torch.float32
@@ -787,10 +928,14 @@ def convert_diffusion_transformer_hybrid_image_policy_to_coreml(
 
 # In the original implementation, the model is inferenced with 100 ddpm steps, so the compilation time is long, stay tuned.
 # python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --convert-all True
-# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --num-inference-steps 10 --convert-all True # debug
 # python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d6_mlpackage --n-layer 6 --strict-loading False --convert-all True
 # python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d4_mlpackage --n-layer 4 --strict-loading False --convert-all True
 # python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d2_mlpackage --n-layer 2 --strict-loading False --convert-all True
+# convert gc_denoiser
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --convert-model True
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d6_mlpackage --n-layer 6 --strict-loading False --convert-model True
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d4_mlpackage --n-layer 4 --strict-loading False --convert-model True
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d2_mlpackage --n-layer 2 --strict-loading False --convert-model True
 @click.command()
 @click.option("--checkpoint", type=str, required=True)
 @click.option("--n-layer", type=int, default=8)

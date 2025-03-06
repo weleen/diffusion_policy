@@ -24,19 +24,36 @@ policy:
   shape_meta: ${shape_meta}
   
   noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
     num_train_timesteps: 100
     beta_start: 0.0001
     beta_end: 0.02
     beta_schedule: squaredcos_cap_v2
-    variance_type: fixed_small # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
-    clip_sample: True # required when predict_epsilon=False
-    prediction_type: epsilon # or sample
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: sample
+    # beta_schedule: squaredcos_cap_v2
+    # variance_type: fixed_small # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
+    # clip_sample: True # required when predict_epsilon=False
+    # prediction_type: epsilon # or sample
+
+  scheduler:
+    _target_: diffusers.schedulers.scheduling_lcm.LCMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: sample
 
   horizon: ${horizon}
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
-  num_inference_steps: 100
+  num_inference_timesteps: 1
+  num_inference_steps: 10
 
   crop_shape: [84, 84]
   obs_encoder_group_norm: True
@@ -55,7 +72,9 @@ policy:
   # 6 in 8: DP-T-D6-6-8 [[6, 8]], DP-T-D6-3-4 [[3, 4], [3, 4]];
   # 4 in 8: DP-T-D4-4-8 [[4, 8]], DP-T-D4-2-4 [[2, 4], [2, 4]], DP-T-D4-1-2 [[1, 2], [1, 2], [1, 2], [1, 2]];
   # 2 in 8: DP-T-D2-2-8 [[2, 8]], DP-T-D2-1-4 [[1, 4], [1, 4]]
-  groups: [[6, 8]] 
+  groups: [[6, 8]] # [[3, 4], [3, 4]]
+  importance_score_type: "svdscore" # "biscore" # "svdscore", "fixed", "random"
+  fixed_importance_score: 0.02
 
   # scheduler.step params
   # predict_epsilon: True
@@ -128,7 +147,7 @@ training:
     include_keys: ['model', 'ema_model']
 
 logging:
-  project: diffusion_policy_prune
+  project: diffusion_policy_prune_distill
   resume: True
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
