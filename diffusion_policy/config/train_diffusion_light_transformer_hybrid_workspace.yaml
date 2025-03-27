@@ -69,6 +69,10 @@ policy:
   time_as_cond: True # if false, use BERT like encoder only arch, time as input
   obs_as_cond: ${obs_as_cond}
 
+  # distillation
+  use_consistency: True
+
+  # prune by learning
   # 6 in 8: DP-T-D6-6-8 [[6, 8]], DP-T-D6-3-4 [[3, 4], [3, 4]];
   # 4 in 8: DP-T-D4-4-8 [[4, 8]], DP-T-D4-2-4 [[2, 4], [2, 4]], DP-T-D4-1-2 [[1, 2], [1, 2], [1, 2], [1, 2]];
   # 2 in 8: DP-T-D2-2-8 [[2, 8]], DP-T-D2-1-4 [[1, 4], [1, 4]]

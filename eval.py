@@ -24,7 +24,10 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 @click.option('-o', '--output_dir', required=True)
 @click.option('-d', '--device', default='cuda:0')
 @click.option('-e', '--eval-time', is_flag=True, default=False)
-def main(checkpoint, output_dir, device, eval_time):
+@click.option('-s', '--scheduler', default='ddim', type=click.Choice(['ddpm','ddim', 'lcm']))
+@click.option('-p', '--prediction-type', default='sample', type=click.Choice(['sample', 'epsilon']))
+@click.option('-n', '--num-inference-steps', default=10)
+def main(checkpoint, output_dir, device, eval_time, scheduler, prediction_type, num_inference_steps):
     if os.path.exists(output_dir):
         click.confirm(f"Output path {output_dir} already exists! Overwrite?", abort=True)
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -32,6 +35,50 @@ def main(checkpoint, output_dir, device, eval_time):
     # load checkpoint
     payload = torch.load(open(checkpoint, 'rb'), pickle_module=dill)
     cfg = payload['cfg']
+
+    # replace ddpm scheduler with ddim scheduler to use ddim sampling
+    if scheduler == 'ddpm':
+        noise_scheduler = {
+            "_target_": "diffusers.schedulers.scheduling_ddpm.DDPMScheduler",
+            "num_train_timesteps": 100,
+            "beta_start": 0.0001,
+            "beta_end": 0.02,
+            "beta_schedule": "squaredcos_cap_v2",
+            "variance_type": "fixed_small", # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
+            "clip_sample": True, # required when predict_epsilon=False
+            "prediction_type": prediction_type, # or sample
+        }
+    elif scheduler == 'ddim':
+        noise_scheduler = {
+            "_target_": "diffusers.schedulers.scheduling_ddim.DDIMScheduler",
+            "num_train_timesteps": 100,
+            "beta_start": 0.0001,
+            "beta_end": 0.02,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": True,
+            "set_alpha_to_one": True,
+            "steps_offset": 0,
+            "prediction_type": prediction_type,
+        }
+        cfg.policy.noise_scheduler = noise_scheduler
+        cfg.policy.num_inference_steps = num_inference_steps
+    elif scheduler == 'lcm':
+        noise_scheduler = {
+            "_target_": "diffusers.schedulers.scheduling_lcm.LCMScheduler",
+            "num_train_timesteps": 100,
+            "beta_start": 0.0001,
+            "beta_end": 0.02,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": True,
+            "set_alpha_to_one": True,
+            "steps_offset": 0,
+            "prediction_type": prediction_type
+        }
+        cfg.policy.scheduler = noise_scheduler
+        cfg.policy.num_inference_timesteps = num_inference_steps
+    else:
+        raise ValueError(f"Scheduler {scheduler} not supported")
+
     cls = hydra.utils.get_class(cfg._target_)
     workspace = cls(cfg, output_dir=output_dir)
     workspace: BaseWorkspace
@@ -82,6 +129,7 @@ def main(checkpoint, output_dir, device, eval_time):
         cfg.task.env_runner,
         output_dir=output_dir)
     runner_log = env_runner.run(policy)
+    print('runner_log', runner_log)
     
     # dump log to json
     json_log = dict()

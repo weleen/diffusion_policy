@@ -34,8 +34,22 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 
 # Set up logging, store at ./mlpackage/torch2coreml.log
+# Create formatter
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Create and configure file handler
 os.makedirs('./mlpackage', exist_ok=True)
-logging.basicConfig(filename='./mlpackage/torch2coreml.log', level=logging.INFO)
+file_handler = logging.FileHandler('./mlpackage/torch2coreml.log')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter)
+
+# Create and configure console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+
+# Configure root logger
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
 logger = logging.getLogger(__name__)
 
 # Version check for torch
@@ -261,6 +275,24 @@ def convert_all_to_coreml(
         )
         return
     
+    # # log the memory usage of the model
+    # logger.info("Logging memory usage of the model...")
+    # logger.info("Before Conversion")
+    # logger.info(f"Memory usage of the model: {torch.cuda.memory_allocated() / 1e6}M")
+    # logger.info(f"Memory usage of the model: {torch.cuda.memory_reserved() / 1e6}M")
+    # logger.info(f"Memory usage of the model: {torch.cuda.max_memory_allocated() / 1e6}M")
+    # logger.info(f"Memory usage of the model: {torch.cuda.max_memory_reserved() / 1e6}M")
+    # model.to('cuda:0')
+    # # log the memory usage of the model
+    # logger.info("Logging memory usage of the model...")
+    # logger.info("After call .to('cuda:0')")
+    # logger.info(f"Memory usage of the model: {torch.cuda.memory_allocated() / 1e6}M")
+    # logger.info(f"Memory usage of the model: {torch.cuda.memory_reserved() / 1e6}M")
+    # logger.info(f"Memory usage of the model: {torch.cuda.max_memory_allocated() / 1e6}M")
+    # logger.info(f"Memory usage of the model: {torch.cuda.max_memory_reserved() / 1e6}M")
+    # model.to('cpu')
+
+
     # Convert all components to an mlpackage
     # including the obs_encoder and the diffusion transformer hybrid image policy
     policy = model.to(torch.float32)
@@ -502,6 +534,19 @@ def convert_all_to_coreml(
     logger.info("Checking model dimensions done.")
     # test the policy wrapper done.
 
+    # calculate the number of parameters in the model
+    num_params = sum(p.numel() for p in policy.parameters())
+    logger.info(f"Number of parameters in the model: {num_params / 1e6}M")
+
+    # calculate the FLOPs of the model
+    from thop import profile
+    flops = profile(test_policy_wrapper, inputs=(policy_inputs["agent_pos"], policy_inputs["image"], policy_inputs["trajectory"], policy_inputs["cond_data"], policy_inputs["cond_mask"]))
+    # import pdb; pdb.set_trace()
+    logger.info(f"FLOPs of the model: {flops[0] / 1e9}GFLOPs")
+    # log the memory usage of the model
+    import pdb; pdb.set_trace()
+
+
     reference_policy_wrapper = PolicyWrapper(policy).eval()
     logger.info(f"JIT tracing reference policy wrapper...")
     traced_reference_policy_wrapper = torch.jit.trace(
@@ -621,6 +666,37 @@ def convert_obs_encoder_to_coreml(
     # Add debug prints before the conversion
     print("Agent pos shape:", obs_inputs["agent_pos"].shape)
     print("Image shape:", obs_inputs["image"].shape)
+
+    # test the policy wrapper
+    logger.info("Checking model dimensions...")
+    test_obs_encoder = ModelWrapper(
+        obs_encoder, 
+        input_shapes["n_obs_steps"], 
+        input_shapes["obs_feature_dim"], 
+        ["agent_pos", "image"]
+    ).eval()
+    with torch.no_grad():
+        test_out = test_obs_encoder(
+            obs_inputs["agent_pos"],
+            obs_inputs["image"],
+        )
+        print(f"Test output shape: {test_out.shape}")
+    logger.info("Checking model dimensions done.")
+    # test the policy wrapper done.
+
+
+    # calculate the number of parameters in the model
+    num_params = sum(p.numel() for p in obs_encoder.parameters())
+    logger.info(f"Number of parameters in the model: {num_params / 1e6}M")
+
+    # calculate the FLOPs of the model
+    from thop import profile
+    flops = profile(test_obs_encoder, inputs=(obs_inputs["agent_pos"], obs_inputs["image"]))
+    # import pdb; pdb.set_trace()
+    logger.info(f"FLOPs of the model: {flops[0] / 1e9}GFLOPs")
+    # log the memory usage of the model
+    import pdb; pdb.set_trace()
+
 
     # Also check the model's linear layer weights
     for name, param in obs_encoder.named_parameters():
@@ -892,6 +968,19 @@ def convert_diffusion_transformer_hybrid_image_policy_to_coreml(
     logger.info("Checking model dimensions done.")
     # test the denoiser done.
 
+    # # calculate the number of parameters in the model
+    # num_params = sum(p.numel() for p in policy.model.parameters())
+    # logger.info(f"Number of parameters in the model: {num_params / 1e6}M")
+
+    # # calculate the FLOPs of the model
+    # from thop import profile
+    # flops = profile(test_denoiser, inputs=(transformer_inputs["trajectory"], transformer_inputs["cond_data"], transformer_inputs["cond_mask"], transformer_inputs["cond"]))
+    # # import pdb; pdb.set_trace()
+    # logger.info(f"FLOPs of the model: {flops[0] / 1e9}GFLOPs")
+    # # log the memory usage of the model
+    # import pdb; pdb.set_trace()
+
+
     reference_transformer_model = TransformerModelWrapper(policy, input_shapes["action_dim"]).eval()
     logger.info(f"JIT tracing reference visual model...")
     traced_reference_visual_model = torch.jit.trace(
@@ -927,7 +1016,9 @@ def convert_diffusion_transformer_hybrid_image_policy_to_coreml(
     )
 
 # In the original implementation, the model is inferenced with 100 ddpm steps, so the compilation time is long, stay tuned.
-# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --convert-all True
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --convert-all True # 27.02442496GFLOPs
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --convert-obs-encoder True #2.36964864GFLOP 
+# python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --convert-model True #4.3932672GFLOPs 
 # python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d6_mlpackage --n-layer 6 --strict-loading False --convert-all True
 # python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d4_mlpackage --n-layer 4 --strict-loading False --convert-all True
 # python coreml/torch2coreml.py --checkpoint ../../pretrained_models/diffusion_policy/train_1/checkpoints/epoch=0400-test_mean_score=0.817.ckpt --output-dir mlpackage/dp_d2_mlpackage --n-layer 2 --strict-loading False --convert-all True

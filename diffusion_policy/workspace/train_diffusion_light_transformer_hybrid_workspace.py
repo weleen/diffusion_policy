@@ -137,14 +137,44 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
-        self.raw_model = copy.deepcopy(self.model) # this is the original model, used as a teacher model
-    
+
         # device transfer
         device = torch.device(cfg.training.device)
         self.model.to(device)
-        self.raw_model.eval()
-        self.raw_model.requires_grad_(False)
-        self.raw_model.to(device)
+
+        assert self.model.use_consistency, "use_consistency must be True"
+        # add a raw model as the teacher model in lcm
+        raw_model = copy.deepcopy(self.ema_model) # this is the original model, used as a teacher model
+        raw_model.use_consistency = False # disable consistency test for raw model
+        noise_scheduler = {
+            "_target_": "diffusers.schedulers.scheduling_ddpm.DDPMScheduler",
+            "num_train_timesteps": 100,
+            "beta_start": 0.0001,
+            "beta_end": 0.02,
+            "beta_schedule": "squaredcos_cap_v2",
+            "variance_type": "fixed_small", # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
+            "clip_sample": True, # required when predict_epsilon=False
+            "prediction_type": "epsilon", # or sample
+        }
+        raw_model.noise_scheduler = hydra.utils.instantiate(noise_scheduler)
+        raw_model.num_inference_steps = 100
+
+        # noise_scheduler = {
+        #     "_target_": "diffusers.schedulers.scheduling_ddim.DDIMScheduler",
+        #     "num_train_timesteps": 100,
+        #     "beta_start": 0.0001,
+        #     "beta_end": 0.02,
+        #     "beta_schedule": "squaredcos_cap_v2",
+        #     "clip_sample": True,
+        #     "set_alpha_to_one": True,
+        #     "steps_offset": 0,
+        #     "prediction_type": "epsilon",
+        # }
+        # raw_model.noise_scheduler = hydra.utils.instantiate(noise_scheduler)
+        # raw_model.num_inference_steps = 10
+        raw_model.eval()
+        raw_model.requires_grad_(False)
+        raw_model.to(device) 
 
         noise_scheduler = self.model.noise_scheduler
         alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
@@ -399,8 +429,8 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
         for i, gate, option in zip(range(len(gates)), gates, options):
             # print(f"gate: {gate}, option: {option}")
             for j in range(len(option)):
-                # get the probability of each option
-                prob = (option[j] * importance_score[cum_groups[i]:cum_groups[i+1]]).sum()
+                # get the probability of each option, use multiplication of (1-importance_score) as drop probability
+                prob = (option[j] * (1 - importance_score)[cum_groups[i]:cum_groups[i+1]]).sum()
                 # print(f"prob: {prob}")
                 new_gates[i][0][j].data.copy_(prob)
         # print(f"gates: {gates}\n")
@@ -412,7 +442,11 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
 
         # run evaluation at the beggining
         # original model
-        if self.ema_model is not None:
+        if raw_model is not None:
+            model_to_eval = raw_model
+            logger.info(f"Using raw model for evaluation")
+            model_to_eval.eval()
+        elif self.ema_model is not None:
             model_to_eval = self.ema_model
             logger.info(f"Using EMA model for evaluation")
             model_to_eval.eval()
@@ -462,7 +496,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                         # compute loss
                         # pass the denoiser of the raw model as a teacher model, and the denoiser of the ema model as a second teacher model.
                         # the obs_encoder of the ema_model will not be ema updated.
-                        train_loss = self.model.compute_loss(batch, self.raw_model.model, self.ema_model.model, solver)
+                        train_loss = self.model.compute_loss(batch, raw_model.model, self.ema_model.model, solver)
                         loss = train_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
@@ -561,7 +595,7 @@ class TrainDiffusionLightTransformerHybridWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = policy.compute_loss(batch, self.raw_model.model, self.ema_model.model, solver)
+                                loss = policy.compute_loss(batch, raw_model.model, self.ema_model.model, solver)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):

@@ -89,6 +89,7 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
             obs_as_cond=True,
             pred_action_steps_only=False,
             num_inference_timesteps=4, # LCM inference steps
+            use_consistency=True,
             # learning by prune
             groups = [[1, 2] for _ in range(4)], # remove 1 in each group with 2 blocks, [6, 8], [4, 8], [2, 8]
             importance_score_type = 'svdscore',
@@ -229,6 +230,7 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         self.pred_action_steps_only = pred_action_steps_only
         self.importance_score_type = importance_score_type
         self.fixed_importance_score = fixed_importance_score
+        self.use_consistency = use_consistency
         self.kwargs = kwargs
 
         if num_inference_steps is None:
@@ -241,7 +243,6 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None,
-            use_consistency=False,
             **kwargs
             ):
         model = self.model
@@ -252,7 +253,7 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
             device=condition_data.device,
             generator=generator)
 
-        if use_consistency:
+        if self.use_consistency:
 
             latents = trajectory * self.scheduler.init_noise_sigma
             # set timesteps
@@ -300,7 +301,7 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], use_consistency=False) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
@@ -350,7 +351,6 @@ class DiffusionLightTransformerHybridImagePolicy(BaseImagePolicy):
             cond_data, 
             cond_mask,
             cond=cond,
-            use_consistency=use_consistency,
             **self.kwargs)
         
         # unnormalize prediction
