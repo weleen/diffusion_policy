@@ -197,6 +197,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.infer_frame_idx = 0
         self.cached_action = None
     
+    def reset(self):
+        self.infer_frame_idx = 0
+        self.cached_action = None
+
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,

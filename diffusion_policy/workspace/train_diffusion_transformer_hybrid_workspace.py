@@ -68,6 +68,16 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
     def run(self):  # Main Entry
         cfg = copy.deepcopy(self.cfg)
 
+        # load pretrained model
+        if cfg.policy.pretrained_ckpt is not None:
+            pretrained_ckpt_path = pathlib.Path(cfg.policy.pretrained_ckpt)
+            assert pretrained_ckpt_path.is_file()
+            self.load_checkpoint(path=pretrained_ckpt_path)
+            # reset global step and epoch
+            self.global_step = 0
+            self.epoch = 0
+            print(f"Loaded pretrained model from {pretrained_ckpt_path}")
+
         # resume training
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()

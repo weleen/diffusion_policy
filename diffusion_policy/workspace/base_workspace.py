@@ -81,7 +81,15 @@ class BaseWorkspace:
 
         for key, value in payload['state_dicts'].items():  # model, ema_model, optimizer
             if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
+                try:
+                    m, u = self.__dict__[key].load_state_dict(value, **kwargs)
+                    if len(m) > 0:
+                        print(f"Missing keys in {key}: {m}")
+                    if len(u) > 0:
+                        print(f"Unexpected keys in {key}: {u}")
+                except Exception as e:
+                    print(f"Error loading state_dict for {key}: {e}")
+                    
         for key in include_keys:
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])

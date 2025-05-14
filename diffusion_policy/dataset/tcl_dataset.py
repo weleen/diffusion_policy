@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torchvision.transforms import transforms
 
-from robokit.data.tcl_datasets import TCLDataset, TCLDatasetHDF5
+from robokit.data.tcl_datasets import TCLDataset #, TCLDatasetHDF5
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
@@ -37,17 +37,17 @@ class TCLImageDataset(BaseImageDataset):
         self.use_h5 = use_h5
         if not use_h5:
             self.tcl_dataset = TCLDataset(data_root, use_extracted=True, load_keys=self.load_keys)
-        else:
-            self.tcl_dataset = TCLDatasetHDF5(
-                data_root, h5_path,
-                keys_config={
-                    "primary_rgb": "rgb",
-                    "gripper_rgb": "rgb",
-                    "language_text": "string",
-                    # "rel_actions": "float",
-                    "robot_obs": "float"
-                },
-                use_extracted=True, load_keys=self.load_keys)
+        # else:
+        #     self.tcl_dataset = TCLDatasetHDF5(
+        #         data_root, h5_path,
+        #         keys_config={
+        #             "primary_rgb": "rgb",
+        #             "gripper_rgb": "rgb",
+        #             "language_text": "string",
+        #             # "rel_actions": "float",
+        #             "robot_obs": "float"
+        #         },
+        #         use_extracted=True, load_keys=self.load_keys)
         self.data_meta = self.tcl_dataset.load_statistics_from_json(os.path.join(data_root, "statistics.json"))
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
         self.dataset_min = np.array(self.data_meta["min"])
