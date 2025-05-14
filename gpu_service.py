@@ -97,10 +97,9 @@ def model_step(step_request: StepRequestWithObservation):
     joint_state = step_request.joint_state
     joint_state = torch.from_numpy(np.array(joint_state)).to("cuda").unsqueeze(0)  # (B,T,6)
     obs_dict = {
-        # "image": primary_img,  # should be (B,T,C,H,W)
         "joint_state": joint_state,  # should be (B,T,6)
     }
-    
+
     if agent.infer_frame_idx % max_cache_action == 0:
         primary_imgs = []
         for idx, primary_img in enumerate(step_request.primary_rgb):
@@ -136,7 +135,7 @@ def model_step(step_request: StepRequestWithObservation):
         gripper_img = torch.stack(gripper_imgs, dim=0)
         gripper_img = gripper_img.to("cuda").unsqueeze(0)
 
-        obs_dict["image"] = primary_img
+        obs_dict["image"] = primary_img  # should be (B,T,C,H,W)
         if "gripper" in hydra_config.shape_meta["obs"]:
             obs_dict["gripper"] = gripper_img
     # cond = {
