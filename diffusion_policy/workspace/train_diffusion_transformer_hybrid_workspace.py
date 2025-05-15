@@ -72,7 +72,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
-        normalizer = dataset.get_normalizer()
+        normalizer = dataset.get_normalizer() # 数据集归一化
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()

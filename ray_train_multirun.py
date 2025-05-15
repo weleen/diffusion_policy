@@ -70,7 +70,7 @@ def main(config_name, config_dir, seeds, monitor_key, ray_address,
     
         # manually create output dir
         output_dir = pathlib.Path(cfg.multi_run.run_dir)
-        output_dir.mkdir(parents=True, exist_ok=False)
+        output_dir.mkdir(parents=True, exist_ok=True)
         config_path = output_dir.joinpath('config.yaml')
         print(output_dir)
 
@@ -101,7 +101,7 @@ def main(config_name, config_dir, seeds, monitor_key, ray_address,
         for i, seed in enumerate(seeds):
             test_start_seed = (seed + 1) * 100000
             this_output_dir = output_dir.joinpath(f'train_{i}')
-            this_output_dir.mkdir()
+            this_output_dir.mkdir(parents=True, exist_ok=True)
             wandb_name = name_base + f'_train_{i}'
             wandb_run_id = wandb_group_id + f'_train_{i}'
 
