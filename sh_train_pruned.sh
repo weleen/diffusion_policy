@@ -17,9 +17,6 @@
 #  hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
 
-CONFIG_NAME="tcl_dp_transformer_pruned.yaml"
-DEVICE="cuda:0"
-
 export HYDRA_FULL_ERROR=1
 
 set -e
@@ -29,6 +26,14 @@ wandb online
 
 # diffusion policy (on TCL): https://github.com/ygtxr1997/dp23rss_fork/tree/main#
 # checkpoint dir: /mnt/dongxu-fs1/data-hdd/geyuan/code/dp23rss_fork/data/outputs/2025.05.11/01.08.40_train_diffusion_transformer_hybrid_pusht_images
+CONFIG_NAME="tcl_dp_transformer_pruned_l6.yaml"
+DEVICE="cuda:0"
+
 python train.py --config-dir=. --config-name=${CONFIG_NAME} training.seed=42  \
   training.device=${DEVICE}  \
-  hydra.run.dir='data/outputs/pruned/2025.05.13/2/'
+  hydra.run.dir='data/outputs/pruned/2025.05.13/pruned_l6_ft/'
+# CONFIG_NAME="tcl_dp_transformer_pruned_distill_l6.yaml"
+# DEVICE="cuda:1"
+# python train.py --config-dir=. --config-name=${CONFIG_NAME} training.seed=42  \
+#   training.device=${DEVICE}  \
+#   hydra.run.dir='data/outputs/pruned/2025.05.13/pruned_distill_l6/'
